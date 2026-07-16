@@ -1,0 +1,52 @@
+// ============================================================================
+// STEP 12: UPLOAD PROFILE PHOTO VIA RAILWAY PROXY
+// ============================================================================
+// Add this INSIDE the if(newItemId != "") block, after the Recruit update
+// (after the line: info "Updated Recruit: Talant_Pool='Uploaded'...")
+//
+// Replace YOUR_RAILWAY_URL and YOUR_API_KEY with actual values.
+// ============================================================================
+
+// Check if candidate has a photo (Photo_Uploaded is a checkbox in Recruit)
+// If you don't have this field, you can skip the check and let the service
+// return an error if there's no photo (it won't crash the sync).
+hasPhoto = ifnull(candidate.get("Photo"), "");
+if(hasPhoto != "")
+{
+    info "Uploading profile photo for candidate " + candidateId + " to Webflow...";
+
+    photoPayload = Map();
+    photoPayload.put("candidateId", candidateId);
+    photoPayload.put("webflowItemId", newItemId);
+    photoPayload.put("candidateName", ifnull(candidate.get("First_Name"), ""));
+
+    photoHeaders = Map();
+    photoHeaders.put("Content-Type", "application/json");
+    photoHeaders.put("X-API-Key", "YOUR_API_KEY");
+
+    photoResponse = invokeurl
+    [
+        url :"YOUR_RAILWAY_URL/upload"
+        type :POST
+        headers :photoHeaders
+        parameters :photoPayload.toString()
+    ];
+
+    photoResp = photoResponse.toMap();
+    photoSuccess = ifnull(photoResp.get("success"), "");
+
+    if(photoSuccess == "true")
+    {
+        info "Photo uploaded successfully for candidate " + candidateId + ". Asset: " + ifnull(photoResp.get("assetId"), "");
+    }
+    else
+    {
+        info "Photo upload failed for candidate " + candidateId + ": " + ifnull(photoResp.get("details"), photoResponse.toString());
+        // Don't fail the whole sync -- photo is optional
+        // Just log it so it can be uploaded manually later
+    }
+}
+else
+{
+    info "No photo found for candidate " + candidateId + ", skipping photo upload.";
+}

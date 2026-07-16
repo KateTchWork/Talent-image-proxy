@@ -1,0 +1,17 @@
+{
+  "name": "talent-image-proxy",
+  "version": "1.0.0",
+  "description": "Zoho Recruit → Webflow image upload proxy for talent pool profiles",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "sharp": "^0.33.5",
+    "form-data": "^4.0.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
