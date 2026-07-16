@@ -1,3 +1,4 @@
+// v1.1 - Content-Length fix for S3 uploads
 const express = require("express");
 const sharp = require("sharp");
 const crypto = require("crypto");
