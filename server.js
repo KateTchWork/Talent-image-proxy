@@ -88,35 +88,41 @@ async function convertToWebP(imageBuffer) {
 // ── Helper: POST multipart form using native https (no axios needed) ─────────
 function postMultipart(url, formData) {
   return new Promise((resolve, reject) => {
-    const parsed = new URL(url);
-    const transport = parsed.protocol === "https:" ? https : http;
+    // Get the full form buffer so we can set Content-Length (S3 requires it)
+    formData.getLength((err, length) => {
+      if (err) return reject(new Error(`Failed to get form length: ${err.message}`));
 
-    const options = {
-      method: "POST",
-      hostname: parsed.hostname,
-      port: parsed.port,
-      path: parsed.pathname + parsed.search,
-      headers: formData.getHeaders(),
-      // S3 redirects on success — follow it
-      maxRedirects: 5,
-    };
+      const parsed = new URL(url);
+      const transport = parsed.protocol === "https:" ? https : http;
 
-    const req = transport.request(options, (res) => {
-      const chunks = [];
-      res.on("data", (c) => chunks.push(c));
-      res.on("end", () => {
-        const body = Buffer.concat(chunks).toString();
-        // S3 returns 201 or 204 on success, 303 if success_action_redirect
-        if (res.statusCode >= 200 && res.statusCode < 400) {
-          resolve({ status: res.statusCode, body, headers: res.headers });
-        } else {
-          reject(new Error(`S3 upload failed (${res.statusCode}): ${body}`));
-        }
+      const headers = formData.getHeaders();
+      headers["content-length"] = length;
+
+      const options = {
+        method: "POST",
+        hostname: parsed.hostname,
+        port: parsed.port,
+        path: parsed.pathname + parsed.search,
+        headers,
+      };
+
+      const req = transport.request(options, (res) => {
+        const chunks = [];
+        res.on("data", (c) => chunks.push(c));
+        res.on("end", () => {
+          const body = Buffer.concat(chunks).toString();
+          // S3 returns 201 or 204 on success, 303 if success_action_redirect
+          if (res.statusCode >= 200 && res.statusCode < 400) {
+            resolve({ status: res.statusCode, body, headers: res.headers });
+          } else {
+            reject(new Error(`S3 upload failed (${res.statusCode}): ${body}`));
+          }
+        });
       });
-    });
 
-    req.on("error", reject);
-    formData.pipe(req);
+      req.on("error", reject);
+      formData.pipe(req);
+    });
   });
 }
 
