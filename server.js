@@ -59,13 +59,49 @@ async function getZohoAccessToken() {
 }
 
 // ── Fetch candidate photo from Zoho Recruit ──────────────────────────────────
+// First tries attachments with category "Profile Picture" (uncropped).
+// Falls back to the profile photo endpoint (square-cropped by Recruit).
 async function fetchCandidatePhoto(candidateId) {
   const token = await getZohoAccessToken();
-  const url = `https://${ZOHO_RECRUIT_DOMAIN}/recruit/v2/Candidates/${candidateId}/photo`;
+  const authHeader = { Authorization: `Zoho-oauthtoken ${token}` };
 
-  const res = await fetch(url, {
-    headers: { Authorization: `Zoho-oauthtoken ${token}` },
-  });
+  // Try attachments first — look for "Profile Picture" category
+  try {
+    const listUrl = `https://${ZOHO_RECRUIT_DOMAIN}/recruit/v2/Candidates/${candidateId}/Attachments`;
+    const listRes = await fetch(listUrl, { headers: authHeader });
+
+    if (listRes.ok) {
+      const listData = await listRes.json();
+      const attachments = listData.data || [];
+
+      // Find the most recent attachment with category "Profile Picture"
+      // Recruit API returns Category as { name: "Profile Picture", id: "..." }
+      const profilePic = attachments
+        .filter((a) => {
+          const cat = a.Category?.name || a.category || "";
+          return cat === "Profile Picture";
+        })
+        .sort((a, b) => new Date(b.Modified_Time) - new Date(a.Modified_Time))[0];
+
+      if (profilePic) {
+        console.log(`Found attachment: "${profilePic.File_Name}" (${profilePic.Category?.name})`);
+        const dlUrl = `https://${ZOHO_RECRUIT_DOMAIN}/recruit/v2/Candidates/${candidateId}/Attachments/${profilePic.id}`;
+        const dlRes = await fetch(dlUrl, { headers: authHeader });
+
+        if (dlRes.ok) {
+          console.log("Downloaded attachment (uncropped)");
+          return Buffer.from(await dlRes.arrayBuffer());
+        }
+      }
+    }
+  } catch (err) {
+    console.log(`Attachment fetch failed, falling back to photo: ${err.message}`);
+  }
+
+  // Fallback: profile photo endpoint (square-cropped)
+  console.log("No 'Profile Picture' attachment found, trying profile photo...");
+  const photoUrl = `https://${ZOHO_RECRUIT_DOMAIN}/recruit/v2/Candidates/${candidateId}/photo`;
+  const res = await fetch(photoUrl, { headers: authHeader });
 
   if (res.status === 204 || res.status === 404) {
     throw new Error(`No photo found for candidate ${candidateId}`);
@@ -75,13 +111,17 @@ async function fetchCandidatePhoto(candidateId) {
     throw new Error(`Recruit photo fetch failed (${res.status}): ${text}`);
   }
 
+  console.log("Downloaded profile photo (square-cropped fallback)");
   return Buffer.from(await res.arrayBuffer());
 }
 
 // ── Convert to WebP with sharp ───────────────────────────────────────────────
+// Zoho Recruit crops photos to square. Resize to 620x296 landscape (matching
+// existing talent pool images) would cut off too much. Instead, just convert
+// to WebP without forced cropping — let Webflow CSS handle the display.
 async function convertToWebP(imageBuffer) {
   return sharp(imageBuffer)
-    .resize(400, 400, { fit: "cover", position: "top" })
+    .resize(620, undefined, { fit: "inside", withoutEnlargement: true })
     .webp({ quality: 80 })
     .toBuffer();
 }
@@ -179,7 +219,7 @@ async function uploadToWebflowAssets(webpBuffer, fileName) {
 }
 
 // ── Update CMS item with the uploaded image ──────────────────────────────────
-async function updateCmsItemImage(webflowItemId, assetId) {
+async function updateCmsItemImage(webflowItemId, assetId, assetUrl, altText) {
   const url = `https://api.webflow.com/v2/collections/${WEBFLOW_COLLECTION_ID}/items/${webflowItemId}/live`;
 
   const res = await fetch(url, {
@@ -189,9 +229,25 @@ async function updateCmsItemImage(webflowItemId, assetId) {
       "Content-Type": "application/json",
       Accept: "application/json",
     },
+    // ── FIX 2026-11-10 ────────────────────────────────────────────────────
+    // Webflow's single-item live PATCH requires the item `id` INSIDE the body
+    // as well as in the URL. Without it the API answers
+    //   400 {"message":"Bad Request: Request is malformed: Missing fields"}
+    // and the details array is empty, which makes it look like a field-format
+    // problem when it is not. Nothing in this file changed — Webflow tightened
+    // the schema, so uploads that used to work started failing at the last
+    // step with the asset already uploaded.
+    //
+    // `url` is genuinely required too: sending fileId alone is rejected with
+    // "Expected value to have a 'url' field". Both are sent below.
     body: JSON.stringify({
+      id: webflowItemId,
       fieldData: {
-        [WEBFLOW_IMAGE_FIELD]: assetId,
+        [WEBFLOW_IMAGE_FIELD]: {
+          fileId: assetId,
+          url: assetUrl,
+          alt: altText || null,
+        },
       },
     }),
   });
@@ -213,13 +269,15 @@ app.post("/upload", async (req, res) => {
     return res.status(401).json({ error: "Unauthorized" });
   }
 
-  const { candidateId, webflowItemId, candidateName } = req.body;
+  const { candidateId, webflowItemId, candidateName, candidateCode } = req.body;
 
   if (!candidateId || !webflowItemId) {
     return res.status(400).json({ error: "candidateId and webflowItemId are required" });
   }
 
-  const fileName = `talent-${candidateId}.webp`;
+  // Use candidateCode (e.g. "Talent-4667") for file name, fallback to candidateId
+  const code = candidateCode || candidateId;
+  const fileName = `${code}.webp`;
 
   try {
     console.log(`\n── Upload started: candidate ${candidateId} → item ${webflowItemId} ──`);
@@ -236,8 +294,9 @@ app.post("/upload", async (req, res) => {
     // 3. Upload to Webflow Assets
     const { assetId, assetUrl } = await uploadToWebflowAssets(webpBuffer, fileName);
 
-    // 4. Update CMS item
-    await updateCmsItemImage(webflowItemId, assetId);
+    // 4. Update CMS item with image + alt text
+    const altText = code.toUpperCase();
+    await updateCmsItemImage(webflowItemId, assetId, assetUrl, altText);
 
     console.log(`── Upload complete: ${fileName} ──\n`);
 
