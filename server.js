@@ -1,4 +1,4 @@
-// v1.1 - Content-Length fix for S3 uploads
+// v1.2 - photo source selection fix (17.11.2026)
 const express = require("express");
 const sharp = require("sharp");
 const crypto = require("crypto");
@@ -23,6 +23,10 @@ const {
   WEBFLOW_IMAGE_FIELD = "profile-picture",
   PORT = "3000",
 } = process.env;
+
+// Anything narrower than this came from the square avatar endpoint, not a real
+// upload. Logged as a warning so it is visible in Railway without guessing.
+const MIN_GOOD_WIDTH = 500;
 
 // ── Zoho OAuth token cache ───────────────────────────────────────────────────
 let accessToken = null;
@@ -59,71 +63,162 @@ async function getZohoAccessToken() {
 }
 
 // ── Fetch candidate photo from Zoho Recruit ──────────────────────────────────
-// First tries attachments with category "Profile Picture" (uncropped).
-// Falls back to the profile photo endpoint (square-cropped by Recruit).
+//
+// ══ FIX 17.11.2026 ═══════════════════════════════════════════════════════════
+// The old version matched attachments with  Category.name === "Profile Picture"
+// — exact and case sensitive. Anything else fell through to the /photo endpoint,
+// which serves Recruit's SQUARE AVATAR: small, cropped, and then left at that
+// size because convertToWebP uses withoutEnlargement.
+//
+// That produced the two bugs reported:
+//   TALENT-12810  369x368   <- square, small  = came from /photo
+//   TALENT-12955  326x360   <- square, small  = came from /photo
+//   TALENT-13013  620x332   <- landscape      = came from the attachment  ✅
+//   TALENT-14692  no image  <- no category match AND no avatar -> threw
+//
+// A photo uploaded as an attachment with no category, a lowercase category, or
+// any other label was invisible to the old matcher even though it was sitting
+// right there on the record.
+//
+// Now the attachment list is tried in four steps, newest first at each step,
+// and /photo is only ever a last resort. The chosen source is logged.
+// ═════════════════════════════════════════════════════════════════════════════
+
+const IMAGE_EXT = /\.(jpe?g|png|webp|gif|bmp|tiff?|heic|heif|avif)$/i;
+
+// "Profile Picture", "profile picture", "Profile_Picture" all normalise the same
+function normCat(value) {
+  if (!value) return "";
+  const raw = typeof value === "string" ? value : value.name || "";
+  return raw.toLowerCase().replace(/[^a-z]/g, "");
+}
+
+function attachmentCategory(a) {
+  return normCat(a.Category || a.category || a.Category_Name || "");
+}
+
+function newestFirst(a, b) {
+  const ta = new Date(a.Modified_Time || a.Created_Time || 0).getTime();
+  const tb = new Date(b.Modified_Time || b.Created_Time || 0).getTime();
+  return tb - ta;
+}
+
 async function fetchCandidatePhoto(candidateId) {
   const token = await getZohoAccessToken();
   const authHeader = { Authorization: `Zoho-oauthtoken ${token}` };
 
-  // Try attachments first — look for "Profile Picture" category
+  let attachments = [];
   try {
     const listUrl = `https://${ZOHO_RECRUIT_DOMAIN}/recruit/v2/Candidates/${candidateId}/Attachments`;
     const listRes = await fetch(listUrl, { headers: authHeader });
-
     if (listRes.ok) {
       const listData = await listRes.json();
-      const attachments = listData.data || [];
-
-      // Find the most recent attachment with category "Profile Picture"
-      // Recruit API returns Category as { name: "Profile Picture", id: "..." }
-      const profilePic = attachments
-        .filter((a) => {
-          const cat = a.Category?.name || a.category || "";
-          return cat === "Profile Picture";
-        })
-        .sort((a, b) => new Date(b.Modified_Time) - new Date(a.Modified_Time))[0];
-
-      if (profilePic) {
-        console.log(`Found attachment: "${profilePic.File_Name}" (${profilePic.Category?.name})`);
-        const dlUrl = `https://${ZOHO_RECRUIT_DOMAIN}/recruit/v2/Candidates/${candidateId}/Attachments/${profilePic.id}`;
-        const dlRes = await fetch(dlUrl, { headers: authHeader });
-
-        if (dlRes.ok) {
-          console.log("Downloaded attachment (uncropped)");
-          return Buffer.from(await dlRes.arrayBuffer());
-        }
-      }
+      attachments = listData.data || [];
+    } else if (listRes.status !== 204) {
+      console.log(`Attachment list returned ${listRes.status}`);
     }
   } catch (err) {
-    console.log(`Attachment fetch failed, falling back to photo: ${err.message}`);
+    console.log(`Attachment list failed: ${err.message}`);
   }
 
-  // Fallback: profile photo endpoint (square-cropped)
-  console.log("No 'Profile Picture' attachment found, trying profile photo...");
+  console.log(`Attachments on record: ${attachments.length}`);
+  for (const a of attachments) {
+    console.log(`   - "${a.File_Name}"  category="${a.Category?.name || a.Category || "(none)"}"`);
+  }
+
+  const images = attachments.filter((a) => IMAGE_EXT.test(a.File_Name || ""));
+
+  // 1 — category is exactly "Profile Picture", however it is spelled or cased
+  let pick = images.filter((a) => attachmentCategory(a) === "profilepicture").sort(newestFirst)[0];
+  let how = "attachment (category: Profile Picture)";
+
+  // 2 — any category that mentions profile / photo / picture
+  if (!pick) {
+    pick = images
+      .filter((a) => {
+        const c = attachmentCategory(a);
+        return c.includes("profile") || c.includes("photo") || c.includes("picture");
+      })
+      .sort(newestFirst)[0];
+    if (pick) how = `attachment (category: ${pick.Category?.name || pick.Category || "?"})`;
+  }
+
+  // 3 — a file NAMED like a profile picture, whatever its category
+  if (!pick) {
+    pick = images
+      .filter((a) => /profile|photo|picture|avatar|headshot/i.test(a.File_Name || ""))
+      .sort(newestFirst)[0];
+    if (pick) how = "attachment (matched by file name)";
+  }
+
+  // 4 — just the newest image attachment on the record
+  //     🔴 This is the branch that fixes the reported bug. A photo uploaded
+  //     without any category is still the real photo.
+  if (!pick) {
+    pick = images.sort(newestFirst)[0];
+    if (pick) how = "attachment (newest image, no category)";
+  }
+
+  if (pick) {
+    try {
+      const dlUrl = `https://${ZOHO_RECRUIT_DOMAIN}/recruit/v2/Candidates/${candidateId}/Attachments/${pick.id}`;
+      const dlRes = await fetch(dlUrl, { headers: authHeader });
+      if (dlRes.ok) {
+        console.log(`Photo source: ${how} -> "${pick.File_Name}"`);
+        return Buffer.from(await dlRes.arrayBuffer());
+      }
+      console.log(`Attachment download failed (${dlRes.status}), falling back to /photo`);
+    } catch (err) {
+      console.log(`Attachment download threw: ${err.message}`);
+    }
+  }
+
+  // 5 — last resort: Recruit's square-cropped avatar
+  console.log("⚠️  No usable image attachment — falling back to the /photo avatar (small, square)");
   const photoUrl = `https://${ZOHO_RECRUIT_DOMAIN}/recruit/v2/Candidates/${candidateId}/photo`;
   const res = await fetch(photoUrl, { headers: authHeader });
 
   if (res.status === 204 || res.status === 404) {
-    throw new Error(`No photo found for candidate ${candidateId}`);
+    throw new Error(
+      `No photo found for candidate ${candidateId} — ` +
+      `${attachments.length} attachment(s) on the record, ${images.length} of them images, ` +
+      `and no profile avatar set`
+    );
   }
   if (!res.ok) {
     const text = await res.text();
     throw new Error(`Recruit photo fetch failed (${res.status}): ${text}`);
   }
 
-  console.log("Downloaded profile photo (square-cropped fallback)");
+  console.log("Photo source: /photo avatar (square-cropped fallback)");
   return Buffer.from(await res.arrayBuffer());
 }
 
 // ── Convert to WebP with sharp ───────────────────────────────────────────────
-// Zoho Recruit crops photos to square. Resize to 620x296 landscape (matching
-// existing talent pool images) would cut off too much. Instead, just convert
-// to WebP without forced cropping — let Webflow CSS handle the display.
+// Width is capped at 620 to match the talent pool layout. Smaller originals are
+// NOT upscaled — enlarging adds no detail — but they are logged, because a small
+// result almost always means the wrong source was used upstream.
 async function convertToWebP(imageBuffer) {
-  return sharp(imageBuffer)
+  const before = await sharp(imageBuffer).metadata();
+
+  const out = await sharp(imageBuffer)
+    .rotate()                                   // honour EXIF orientation
     .resize(620, undefined, { fit: "inside", withoutEnlargement: true })
-    .webp({ quality: 80 })
+    .webp({ quality: 82 })
     .toBuffer();
+
+  const after = await sharp(out).metadata();
+  console.log(
+    `Image: ${before.width}x${before.height} ${before.format} -> ` +
+    `${after.width}x${after.height} webp`
+  );
+  if ((after.width || 0) < MIN_GOOD_WIDTH) {
+    console.log(
+      `⚠️  Result is only ${after.width}px wide (under ${MIN_GOOD_WIDTH}). ` +
+      `The source was probably the square avatar, not the uploaded file.`
+    );
+  }
+  return out;
 }
 
 // ── Helper: POST multipart form using native https (no axios needed) ─────────
@@ -319,14 +414,78 @@ app.post("/upload", async (req, res) => {
   }
 });
 
+// ── Diagnostic endpoint ──────────────────────────────────────────────────────
+// Read-only. Shows exactly what Recruit holds for a candidate and which source
+// the uploader would choose, WITHOUT uploading anything.
+//
+//   GET /diagnose/616278000023983298   with header  x-api-key: <API_KEY>
+//
+// Use this whenever a photo looks wrong instead of re-running the sync.
+app.get("/diagnose/:candidateId", async (req, res) => {
+  if (req.headers["x-api-key"] !== API_KEY) {
+    return res.status(401).json({ error: "Unauthorized" });
+  }
+
+  const { candidateId } = req.params;
+  try {
+    const token = await getZohoAccessToken();
+    const authHeader = { Authorization: `Zoho-oauthtoken ${token}` };
+
+    let attachments = [];
+    const listRes = await fetch(
+      `https://${ZOHO_RECRUIT_DOMAIN}/recruit/v2/Candidates/${candidateId}/Attachments`,
+      { headers: authHeader }
+    );
+    if (listRes.ok) attachments = (await listRes.json()).data || [];
+
+    const images = attachments.filter((a) => IMAGE_EXT.test(a.File_Name || ""));
+
+    const avatarRes = await fetch(
+      `https://${ZOHO_RECRUIT_DOMAIN}/recruit/v2/Candidates/${candidateId}/photo`,
+      { headers: authHeader }
+    );
+    const hasAvatar = avatarRes.ok;
+
+    let chosen = null;
+    let dimensions = null;
+    try {
+      const buf = await fetchCandidatePhoto(candidateId);
+      const meta = await sharp(buf).metadata();
+      dimensions = `${meta.width}x${meta.height} ${meta.format}`;
+      chosen = "see logs for the branch used";
+    } catch (e) {
+      chosen = `WOULD FAIL: ${e.message}`;
+    }
+
+    res.json({
+      candidateId,
+      attachmentCount: attachments.length,
+      imageAttachments: images.map((a) => ({
+        fileName: a.File_Name,
+        category: a.Category?.name || a.Category || null,
+        size: a.Size,
+        modified: a.Modified_Time,
+      })),
+      nonImageAttachments: attachments
+        .filter((a) => !IMAGE_EXT.test(a.File_Name || ""))
+        .map((a) => a.File_Name),
+      hasProfileAvatar: hasAvatar,
+      sourceDimensions: dimensions,
+      note: chosen,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message, candidateId });
+  }
+});
+
 // ── Health check ─────────────────────────────────────────────────────────────
 app.get("/health", (_req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
+  res.json({ status: "ok", version: "1.2", timestamp: new Date().toISOString() });
 });
 
 // ── Start ────────────────────────────────────────────────────────────────────
 app.listen(parseInt(PORT), () => {
-  console.log(`Talent image proxy running on port ${PORT}`);
+  console.log(`Talent image proxy v1.2 running on port ${PORT}`);
   console.log(`Image field: ${WEBFLOW_IMAGE_FIELD}`);
   console.log(`Collection: ${WEBFLOW_COLLECTION_ID}`);
 });
